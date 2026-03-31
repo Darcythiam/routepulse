@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoutePulse Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">RoutePulse</p>
+      <h1>GPS Trip Logging and Route Analytics Dashboard</h1>
+      <p class="muted">Flask + PostgreSQL + Leaflet demo for trip replay, stop detection, geofence analysis, and route metrics.</p>
+    </div>
+    <div class="hero-actions">
+      <button id="refreshDashboardBtn">Refresh Dashboard</button>
+      <button id="loadTripsBtn" class="secondary">Load Trips</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel stats-panel">
+      <h2>System Summary</h2>
+      <div id="summaryCards" class="cards"></div>
+      <div class="mini-grid">
+        <div><h3>Top Geofences</h3><div id="topGeofences"></div></div>
+        <div><h3>POI Categories</h3><div id="poiBreakdown"></div></div>
+      </div>
+    </section>
+
+    <section class="panel filter-panel">
+      <h2>Trip Filters</h2>
+      <div class="filters">
+        <label>User ID<input id="filterUserId" type="number" min="1" placeholder="e.g. 1" /></label>
+        <label>Device ID<input id="filterDeviceId" type="number" min="1" placeholder="e.g. 2" /></label>
+        <label>Tag<input id="filterTag" type="text" placeholder="commute" /></label>
+        <label>Min Distance (km)<input id="filterMinDistance" type="number" step="0.1" min="0" placeholder="0.5" /></label>
+        <label>Max Distance (km)<input id="filterMaxDistance" type="number" step="0.1" min="0" placeholder="3.0" /></label>
+      </div>
+      <div class="hero-actions">
+        <button id="applyFiltersBtn">Apply Filters</button>
+        <button id="clearFiltersBtn" class="secondary">Clear</button>
+      </div>
+    </section>
+
+    <section class="panel trip-list-panel">
+      <h2>Trips</h2>
+      <div id="tripList" class="trip-list"></div>
+    </section>
+
+    <section class="panel map-panel">
+      <div class="map-header">
+        <div>
+          <h2>Trip Replay Map</h2>
+          <p id="mapMeta" class="muted">Select a trip to draw its route, stops, POIs, and geofence crossings.</p>
+        </div>
+        <div id="detailChips" class="chips"></div>
+      </div>
+      <div id="map"></div>
+    </section>
+
+    <section class="panel trip-detail-panel">
+      <h2>Trip Detail</h2>
+      <div id="tripDetail" class="trip-detail empty-state">Select a trip to view full metrics.</div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
