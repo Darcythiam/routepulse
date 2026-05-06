@@ -374,5 +374,274 @@ def end_trip(trip_id):
         conn.close()
 
 
+# =========================
+# CRUD + TRANSACTION + EXPLAIN DEMO HELPERS
+# =========================
+
+def validate_lat_lon(lat, lon):
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None, None, "Latitude and longitude must be numbers."
+    if not (-90 <= lat <= 90):
+        return None, None, "Latitude must be between -90 and 90."
+    if not (-180 <= lon <= 180):
+        return None, None, "Longitude must be between -180 and 180."
+    return lat, lon, None
+
+
+def validate_trip_payload(payload, require_points=True):
+    required = ["user_id", "device_id", "started_at"]
+    missing = [field for field in required if not payload.get(field)]
+    if missing:
+        return f"Missing fields: {', '.join(missing)}", None
+
+    points = payload.get("points", [])
+    if require_points and len(points) < 2:
+        return "A trip needs at least two coordinate points.", None
+
+    cleaned_points = []
+    for index, point in enumerate(points, start=1):
+        lat, lon, error = validate_lat_lon(point.get("latitude"), point.get("longitude"))
+        if error:
+            return f"Point {index}: {error}", None
+        recorded_at = point.get("recorded_at") or payload.get("started_at")
+        cleaned_points.append({
+            "latitude": lat,
+            "longitude": lon,
+            "recorded_at": recorded_at,
+            "accuracy_m": point.get("accuracy_m"),
+            "speed_kmh": point.get("speed_kmh"),
+        })
+
+    started_at = payload.get("started_at")
+    ended_at = payload.get("ended_at") or None
+    status = "completed" if ended_at else "in_progress"
+
+    return None, {
+        "user_id": payload.get("user_id"),
+        "device_id": payload.get("device_id"),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "status": status,
+        "points": cleaned_points,
+    }
+
+
+def insert_points(cur, trip_id, points):
+    for point in points:
+        cur.execute(
+            """
+            INSERT INTO gps_points
+                (trip_id, latitude, longitude, recorded_at, accuracy_m, speed_kmh)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                trip_id,
+                point["latitude"],
+                point["longitude"],
+                point["recorded_at"],
+                point.get("accuracy_m"),
+                point.get("speed_kmh"),
+            ),
+        )
+
+
+@app.route("/api/trips", methods=["POST"])
+def create_trip_with_points():
+    payload = request.get_json(force=True)
+    error, data = validate_trip_payload(payload, require_points=True)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING trip_id
+                    """,
+                    (data["user_id"], data["device_id"], data["started_at"], data["ended_at"], data["status"]),
+                )
+                trip_id = cur.fetchone()["trip_id"]
+                insert_points(cur, trip_id, data["points"])
+                refresh_trip_summary(cur, trip_id)
+        return jsonify(fetch_trip_detail(trip_id)), 201
+    finally:
+        conn.close()
+
+
+@app.route("/api/trips/<int:trip_id>", methods=["PUT"])
+def update_trip_with_points(trip_id):
+    payload = request.get_json(force=True)
+    error, data = validate_trip_payload(payload, require_points=True)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE trips
+                    SET user_id = %s,
+                        device_id = %s,
+                        started_at = %s,
+                        ended_at = %s,
+                        status = %s
+                    WHERE trip_id = %s
+                    RETURNING trip_id
+                    """,
+                    (data["user_id"], data["device_id"], data["started_at"], data["ended_at"], data["status"], trip_id),
+                )
+                if not cur.fetchone():
+                    return jsonify({"error": "Trip not found"}), 404
+
+                # Replace the route points for this trip. This lets update use the same UI fields as insert.
+                cur.execute("DELETE FROM gps_points WHERE trip_id = %s", (trip_id,))
+                insert_points(cur, trip_id, data["points"])
+                refresh_trip_summary(cur, trip_id)
+        return jsonify(fetch_trip_detail(trip_id))
+    finally:
+        conn.close()
+
+
+@app.route("/api/trips/<int:trip_id>", methods=["DELETE"])
+def delete_trip(trip_id):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM trips WHERE trip_id = %s RETURNING trip_id", (trip_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Trip not found"}), 404
+        return jsonify({"message": f"Trip {trip_id} deleted. Related gps_points, summaries, stops, and geofence rows were removed by ON DELETE CASCADE."})
+    finally:
+        conn.close()
+
+
+@app.route("/api/transaction-demo", methods=["POST"])
+def transaction_demo():
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action", "commit").lower()
+    conn = get_db_connection()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users_account ORDER BY user_id LIMIT 1")
+            user = cur.fetchone()
+            cur.execute("SELECT device_id FROM devices ORDER BY device_id LIMIT 1")
+            device = cur.fetchone()
+            if not user or not device:
+                conn.rollback()
+                return jsonify({"error": "Need at least one user and one device before running transaction demo."}), 400
+
+            if action == "commit":
+                cur.execute(
+                    """
+                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
+                    VALUES (%s, %s, NOW(), NOW(), 'completed')
+                    RETURNING trip_id
+                    """,
+                    (user["user_id"], device["device_id"]),
+                )
+                trip_id = cur.fetchone()["trip_id"]
+                conn.commit()
+                return jsonify({
+                    "message": f"COMMIT demo complete: inserted Trip {trip_id} and committed it. Refresh trips to see it.",
+                    "sql": ["BEGIN;", "INSERT INTO trips ... RETURNING trip_id;", "COMMIT;"]
+                })
+
+            if action == "rollback":
+                cur.execute(
+                    """
+                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
+                    VALUES (%s, %s, NOW(), NOW(), 'completed')
+                    RETURNING trip_id
+                    """,
+                    (user["user_id"], device["device_id"]),
+                )
+                trip_id = cur.fetchone()["trip_id"]
+                conn.rollback()
+                return jsonify({
+                    "message": f"ROLLBACK demo complete: temporarily inserted Trip {trip_id}, then rolled it back. It will not appear in trips.",
+                    "sql": ["BEGIN;", "INSERT INTO trips ... RETURNING trip_id;", "ROLLBACK;"]
+                })
+
+            if action == "savepoint":
+                cur.execute(
+                    """
+                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
+                    VALUES (%s, %s, NOW(), NOW(), 'completed')
+                    RETURNING trip_id
+                    """,
+                    (user["user_id"], device["device_id"]),
+                )
+                kept_trip_id = cur.fetchone()["trip_id"]
+                cur.execute("SAVEPOINT before_bad_point")
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO gps_points (trip_id, latitude, longitude, recorded_at)
+                        VALUES (%s, %s, %s, NOW())
+                        """,
+                        (kept_trip_id, 999, 999),
+                    )
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT before_bad_point")
+                conn.commit()
+                return jsonify({
+                    "message": f"SAVEPOINT demo complete: kept Trip {kept_trip_id}, attempted invalid coordinates, rolled back only that bad insert, then committed the trip.",
+                    "sql": ["BEGIN;", "INSERT INTO trips ...;", "SAVEPOINT before_bad_point;", "INSERT invalid gps_points ...;", "ROLLBACK TO SAVEPOINT before_bad_point;", "COMMIT;"]
+                })
+
+            conn.rollback()
+            return jsonify({"error": "Action must be commit, rollback, or savepoint."}), 400
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/explain-before-after")
+def explain_before_after():
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE((SELECT trip_id FROM trips ORDER BY trip_id LIMIT 1), 1) AS trip_id")
+                trip_id = cur.fetchone()["trip_id"]
+
+                demo_query = "SELECT point_id, latitude, longitude, recorded_at FROM gps_points WHERE trip_id = %s ORDER BY recorded_at"
+
+                cur.execute("DROP INDEX IF EXISTS idx_demo_gps_points_trip_recorded")
+                cur.execute("DROP INDEX IF EXISTS idx_gps_points_trip_recorded")
+                cur.execute("ANALYZE gps_points")
+                cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + demo_query, (trip_id,))
+                before_plan = [row["QUERY PLAN"] for row in cur.fetchall()]
+
+                cur.execute("CREATE INDEX idx_demo_gps_points_trip_recorded ON gps_points(trip_id, recorded_at)")
+                cur.execute("ANALYZE gps_points")
+                cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + demo_query, (trip_id,))
+                after_plan = [row["QUERY PLAN"] for row in cur.fetchall()]
+
+        return jsonify({
+            "query": demo_query,
+            "index_added": "CREATE INDEX idx_demo_gps_points_trip_recorded ON gps_points(trip_id, recorded_at);",
+            "before_index": before_plan,
+            "after_index": after_plan,
+            "note": "For a small demo dataset PostgreSQL may still choose a sequential scan because it is cheaper. That is normal. The required deliverable is showing the plan before and after adding the index."
+        })
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     app.run(debug=True)

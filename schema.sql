@@ -124,3 +124,13 @@ CREATE INDEX idx_trip_tags_tag_name ON trip_tags(tag_name);
 CREATE INDEX idx_stop_events_nearest_poi_id ON stop_events(nearest_poi_id);
 CREATE INDEX idx_geofence_crossings_geofence_id ON geofence_crossings(geofence_id);
 CREATE INDEX idx_pois_category ON pois(category);
+
+-- Extra indexes added for the UI filter and optimization demo.
+-- LOWER(tag_name) matches the Flask filter LOWER(raw_tag.tag_name) = LOWER(%s).
+CREATE INDEX idx_trip_tags_lower_tag_name ON trip_tags (LOWER(tag_name));
+
+-- Helps min/max distance filtering through v_trip_overview / trip_summaries.
+CREATE INDEX idx_trip_summaries_total_distance ON trip_summaries(total_distance_km);
+
+-- Helps common dashboard sorting when no user/device filter is selected.
+CREATE INDEX idx_trips_started_at_desc ON trips(started_at DESC);
