@@ -114,3 +114,13 @@ CREATE INDEX idx_trips_device_started ON trips(device_id, started_at DESC);
 CREATE INDEX idx_gps_points_trip_recorded ON gps_points(trip_id, recorded_at);
 CREATE INDEX idx_stop_events_trip_started ON stop_events(trip_id, started_at);
 CREATE INDEX idx_geofence_crossings_trip ON geofence_crossings(trip_id, entered_at);
+
+-- Additional indexes for RoutePulse query optimization to support dashboard filtering, tag searches, summary joins,stop-to-POI lookup, and geofence lookup.
+
+CREATE INDEX idx_devices_user_id ON devices(user_id);
+CREATE INDEX idx_trips_status ON trips(status);
+CREATE INDEX idx_trip_tag_map_tag_id ON trip_tag_map(tag_id);
+CREATE INDEX idx_trip_tags_tag_name ON trip_tags(tag_name);
+CREATE INDEX idx_stop_events_nearest_poi_id ON stop_events(nearest_poi_id);
+CREATE INDEX idx_geofence_crossings_geofence_id ON geofence_crossings(geofence_id);
+CREATE INDEX idx_pois_category ON pois(category);
