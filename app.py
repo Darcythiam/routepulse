@@ -117,7 +117,7 @@ def fetch_trip_detail(trip_id):
                 "SELECT stop_id, started_at, ended_at, latitude, longitude, duration_seconds, nearest_poi_id FROM stop_events WHERE trip_id = %s ORDER BY started_at",
                 (trip_id,),
             )
-            stops = cur.fetchall()
+            stops = [dict(s) for s in cur.fetchall()]
 
             cur.execute(
                 """
@@ -131,17 +131,18 @@ def fetch_trip_detail(trip_id):
             )
             geofences = cur.fetchall()
 
+        trip_dict = dict(trip)
         return {
             "trip": {
-                **trip,
-                "started_at": iso(trip["started_at"]),
-                "ended_at": iso(trip["ended_at"]),
+                **trip_dict,
+                "started_at": iso(trip_dict["started_at"]),
+                "ended_at": iso(trip_dict["ended_at"]),
                 "computed_metrics": compute_trip_metrics(points),
             },
-            "points": [{**p, "recorded_at": iso(p["recorded_at"])} for p in points],
-            "stops": [{**s, "started_at": iso(s["started_at"]), "ended_at": iso(s["ended_at"])} for s in stops],
-            "computed_stops": [{**s, "started_at": iso(s["started_at"]), "ended_at": iso(s["ended_at"])} for s in detect_stop_events(points)],
-            "geofences": [{**g, "entered_at": iso(g["entered_at"]), "exited_at": iso(g["exited_at"])} for g in geofences],
+            "points": [{**dict(p), "recorded_at": iso(dict(p)["recorded_at"])} for p in points],
+            "stops": [{**dict(s), "started_at": iso(dict(s)["started_at"]), "ended_at": iso(dict(s)["ended_at"])} for s in stops],
+            "computed_stops": [{**dict(s), "started_at": iso(dict(s)["started_at"]), "ended_at": iso(dict(s)["ended_at"])} for s in detect_stop_events(points)],
+            "geofences": [{**dict(g), "entered_at": iso(dict(g)["entered_at"]), "exited_at": iso(dict(g)["exited_at"])} for g in geofences],
         }
     finally:
         conn.close()
@@ -227,14 +228,32 @@ def dashboard():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            def _fetch_value(row, key='count', default=0, cast=int):
+                if not row:
+                    return default
+                # support both mapping-like rows and sequence rows
+                if hasattr(row, 'get'):
+                    return cast(row.get(key, default))
+                try:
+                    return cast(row[0])
+                except Exception:
+                    return default
+
             cur.execute("SELECT COUNT(*) AS count FROM users_account")
-            users = cur.fetchone()["count"]
+            row = cur.fetchone()
+            users = _fetch_value(row, 'count', 0, int)
+
             cur.execute("SELECT COUNT(*) AS count FROM devices")
-            devices = cur.fetchone()["count"]
+            row = cur.fetchone()
+            devices = _fetch_value(row, 'count', 0, int)
+
             cur.execute("SELECT COUNT(*) AS count FROM trips")
-            trips = cur.fetchone()["count"]
+            row = cur.fetchone()
+            trips = _fetch_value(row, 'count', 0, int)
+
             cur.execute("SELECT COALESCE(SUM(total_distance_km), 0) AS total_distance_km FROM trip_summaries")
-            total_distance = float(cur.fetchone()["total_distance_km"])
+            row = cur.fetchone()
+            total_distance = _fetch_value(row, 'total_distance_km', 0.0, float)
             cur.execute("SELECT geofence_name, crossing_count FROM v_top_geofences LIMIT 5")
             top_geofences = cur.fetchall()
             cur.execute("SELECT category, COUNT(*) AS poi_count FROM pois GROUP BY category ORDER BY poi_count DESC, category")
@@ -285,7 +304,7 @@ def list_trips():
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
-        return jsonify([{**row, "started_at": iso(row["started_at"]), "ended_at": iso(row["ended_at"])} for row in rows])
+        return jsonify([{**dict(row), "started_at": iso(dict(row)["started_at"]), "ended_at": iso(dict(row)["ended_at"])} for row in rows])
     finally:
         conn.close()
 
@@ -524,124 +543,6 @@ def delete_trip(trip_id):
         return jsonify({"message": f"Trip {trip_id} deleted. Related gps_points, summaries, stops, and geofence rows were removed by ON DELETE CASCADE."})
     finally:
         conn.close()
-
-
-@app.route("/api/transaction-demo", methods=["POST"])
-def transaction_demo():
-    payload = request.get_json(silent=True) or {}
-    action = payload.get("action", "commit").lower()
-    conn = get_db_connection()
-    conn.autocommit = False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM users_account ORDER BY user_id LIMIT 1")
-            user = cur.fetchone()
-            cur.execute("SELECT device_id FROM devices ORDER BY device_id LIMIT 1")
-            device = cur.fetchone()
-            if not user or not device:
-                conn.rollback()
-                return jsonify({"error": "Need at least one user and one device before running transaction demo."}), 400
-
-            if action == "commit":
-                cur.execute(
-                    """
-                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
-                    VALUES (%s, %s, NOW(), NOW(), 'completed')
-                    RETURNING trip_id
-                    """,
-                    (user["user_id"], device["device_id"]),
-                )
-                trip_id = cur.fetchone()["trip_id"]
-                conn.commit()
-                return jsonify({
-                    "message": f"COMMIT demo complete: inserted Trip {trip_id} and committed it. Refresh trips to see it.",
-                    "sql": ["BEGIN;", "INSERT INTO trips ... RETURNING trip_id;", "COMMIT;"]
-                })
-
-            if action == "rollback":
-                cur.execute(
-                    """
-                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
-                    VALUES (%s, %s, NOW(), NOW(), 'completed')
-                    RETURNING trip_id
-                    """,
-                    (user["user_id"], device["device_id"]),
-                )
-                trip_id = cur.fetchone()["trip_id"]
-                conn.rollback()
-                return jsonify({
-                    "message": f"ROLLBACK demo complete: temporarily inserted Trip {trip_id}, then rolled it back. It will not appear in trips.",
-                    "sql": ["BEGIN;", "INSERT INTO trips ... RETURNING trip_id;", "ROLLBACK;"]
-                })
-
-            if action == "savepoint":
-                cur.execute(
-                    """
-                    INSERT INTO trips (user_id, device_id, started_at, ended_at, status)
-                    VALUES (%s, %s, NOW(), NOW(), 'completed')
-                    RETURNING trip_id
-                    """,
-                    (user["user_id"], device["device_id"]),
-                )
-                kept_trip_id = cur.fetchone()["trip_id"]
-                cur.execute("SAVEPOINT before_bad_point")
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO gps_points (trip_id, latitude, longitude, recorded_at)
-                        VALUES (%s, %s, %s, NOW())
-                        """,
-                        (kept_trip_id, 999, 999),
-                    )
-                except Exception:
-                    cur.execute("ROLLBACK TO SAVEPOINT before_bad_point")
-                conn.commit()
-                return jsonify({
-                    "message": f"SAVEPOINT demo complete: kept Trip {kept_trip_id}, attempted invalid coordinates, rolled back only that bad insert, then committed the trip.",
-                    "sql": ["BEGIN;", "INSERT INTO trips ...;", "SAVEPOINT before_bad_point;", "INSERT invalid gps_points ...;", "ROLLBACK TO SAVEPOINT before_bad_point;", "COMMIT;"]
-                })
-
-            conn.rollback()
-            return jsonify({"error": "Action must be commit, rollback, or savepoint."}), 400
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
-
-
-@app.route("/api/explain-before-after")
-def explain_before_after():
-    conn = get_db_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COALESCE((SELECT trip_id FROM trips ORDER BY trip_id LIMIT 1), 1) AS trip_id")
-                trip_id = cur.fetchone()["trip_id"]
-
-                demo_query = "SELECT point_id, latitude, longitude, recorded_at FROM gps_points WHERE trip_id = %s ORDER BY recorded_at"
-
-                cur.execute("DROP INDEX IF EXISTS idx_demo_gps_points_trip_recorded")
-                cur.execute("DROP INDEX IF EXISTS idx_gps_points_trip_recorded")
-                cur.execute("ANALYZE gps_points")
-                cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + demo_query, (trip_id,))
-                before_plan = [row["QUERY PLAN"] for row in cur.fetchall()]
-
-                cur.execute("CREATE INDEX idx_demo_gps_points_trip_recorded ON gps_points(trip_id, recorded_at)")
-                cur.execute("ANALYZE gps_points")
-                cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + demo_query, (trip_id,))
-                after_plan = [row["QUERY PLAN"] for row in cur.fetchall()]
-
-        return jsonify({
-            "query": demo_query,
-            "index_added": "CREATE INDEX idx_demo_gps_points_trip_recorded ON gps_points(trip_id, recorded_at);",
-            "before_index": before_plan,
-            "after_index": after_plan,
-            "note": "For a small demo dataset PostgreSQL may still choose a sequential scan because it is cheaper. That is normal. The required deliverable is showing the plan before and after adding the index."
-        })
-    finally:
-        conn.close()
-
 
 if __name__ == "__main__":
     app.run(debug=True)

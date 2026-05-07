@@ -24,5 +24,4 @@ FROM gps_points
 WHERE trip_id = 1
 ORDER BY recorded_at;
 
--- Note: if your table is very small, PostgreSQL may still choose a sequential scan.
--- That does not mean your index is wrong; it means the planner estimates seq scan is cheaper for small data.
+
