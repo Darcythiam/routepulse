@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS postgis;
+
 DROP TABLE IF EXISTS geofence_crossings CASCADE;
 DROP TABLE IF EXISTS stop_events CASCADE;
 DROP TABLE IF EXISTS gps_points CASCADE;
@@ -43,6 +45,8 @@ CREATE TABLE gps_points (
     recorded_at TIMESTAMPTZ NOT NULL,
     accuracy_m NUMERIC(8,2),
     speed_kmh NUMERIC(8,2),
+    location geography(Point, 4326) GENERATED ALWAYS AS
+        (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography) STORED,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -64,6 +68,8 @@ CREATE TABLE geofences (
     center_lat NUMERIC(9,6) NOT NULL,
     center_lon NUMERIC(9,6) NOT NULL,
     radius_m NUMERIC(10,2) NOT NULL CHECK (radius_m > 0),
+    location geography(Point, 4326) GENERATED ALWAYS AS
+        (ST_SetSRID(ST_MakePoint(center_lon, center_lat), 4326)::geography) STORED,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -81,7 +87,9 @@ CREATE TABLE pois (
     poi_name VARCHAR(120) NOT NULL,
     category VARCHAR(80) NOT NULL,
     latitude NUMERIC(9,6) NOT NULL,
-    longitude NUMERIC(9,6) NOT NULL
+    longitude NUMERIC(9,6) NOT NULL,
+    location geography(Point, 4326) GENERATED ALWAYS AS
+        (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography) STORED
 );
 
 ALTER TABLE stop_events
@@ -102,7 +110,7 @@ CREATE TABLE trip_tag_map (
 CREATE TABLE trip_summaries (
     trip_id INTEGER PRIMARY KEY REFERENCES trips(trip_id) ON DELETE CASCADE,
     point_count INTEGER NOT NULL DEFAULT 0,
-    total_distance_km NUMERIC(10,3) NOT NULL DEFAULT 0,
+    total_distance_km NUMERIC(14,6) NOT NULL DEFAULT 0,
     duration_minutes NUMERIC(10,2) NOT NULL DEFAULT 0,
     avg_speed_kmh NUMERIC(10,2) NOT NULL DEFAULT 0,
     stop_count INTEGER NOT NULL DEFAULT 0,
@@ -112,6 +120,9 @@ CREATE TABLE trip_summaries (
 CREATE INDEX idx_trips_user_started ON trips(user_id, started_at DESC);
 CREATE INDEX idx_trips_device_started ON trips(device_id, started_at DESC);
 CREATE INDEX idx_gps_points_trip_recorded ON gps_points(trip_id, recorded_at);
+CREATE INDEX idx_gps_points_location_gist ON gps_points USING GIST (location);
+CREATE INDEX idx_pois_location_gist ON pois USING GIST (location);
+CREATE INDEX idx_geofences_location_gist ON geofences USING GIST (location);
 CREATE INDEX idx_stop_events_trip_started ON stop_events(trip_id, started_at);
 CREATE INDEX idx_geofence_crossings_trip ON geofence_crossings(trip_id, entered_at);
 

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: routepulse
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: routepulse }
+  template:
+    metadata:
+      labels: { app: routepulse }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "5000"
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/replace-with-your-user/routepulse:replace-with-tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: http
+          envFrom:
+            - secretRef:
+                name: routepulse-secrets
+          livenessProbe:
+            httpGet: { path: /api/health/live, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /api/health/ready, port: http }
+            periodSeconds: 5
+          startupProbe:
+            httpGet: { path: /api/health/live, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: routepulse
+spec:
+  selector: { app: routepulse }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: LoadBalancer
