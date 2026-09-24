@@ -1,4 +1,10 @@
 let map, routeLayer, markerLayer, circleLayer, currentTripId = null;
+let liveSocket = null, livePolyline = null, liveMarker = null, reconnectTimer = null;
+let knownPointIds = new Set();
+
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+})[ch]);
 
 const formatNumber = (v, d = 2) => {
   const n = Number(v ?? 0);
@@ -82,7 +88,7 @@ async function loadDashboard() {
     data.top_geofences,
     item => el(`
       <div class="list-item">
-        <strong>${item.geofence_name}</strong><br />
+        <strong>${escapeHtml(item.geofence_name)}</strong><br />
         <span class="muted">
           ${item.crossing_count} crossing(s)
         </span>
@@ -95,7 +101,7 @@ async function loadDashboard() {
     data.poi_breakdown,
     item => el(`
       <div class="list-item">
-        <strong>${item.category}</strong><br />
+        <strong>${escapeHtml(item.category)}</strong><br />
         <span class="muted">
           ${item.poi_count} POI(s)
         </span>
@@ -142,9 +148,9 @@ async function loadTrips() {
         <strong>Trip #${trip.trip_id}</strong>
 
         <div class="meta">
-          ${trip.full_name}<br />
-          ${trip.device_name}
-          (${trip.device_type})<br />
+          ${escapeHtml(trip.full_name)}<br />
+          ${escapeHtml(trip.device_name)}
+          (${escapeHtml(trip.device_type)})<br />
 
           ${formatDate(trip.started_at)}
           →
@@ -239,17 +245,17 @@ function renderTripDetail(detail) {
         <h3>Status</h3>
 
         <p>
-          <strong>${trip.status}</strong>
+          <strong>${escapeHtml(trip.status)}</strong>
         </p>
 
         <p>
           User:
-          <strong>${trip.full_name}</strong>
+          <strong>${escapeHtml(trip.full_name)}</strong>
         </p>
 
         <p>
           Device:
-          <strong>${trip.device_name}</strong>
+          <strong>${escapeHtml(trip.device_name)}</strong>
         </p>
       </div>
 
@@ -267,7 +273,7 @@ async function renderReferenceLayers() {
     );
 
     marker.bindPopup(
-      `<strong>${poi.poi_name}</strong><br />${poi.category}`
+      `<strong>${escapeHtml(poi.poi_name)}</strong><br />${escapeHtml(poi.category)}`
     );
 
     markerLayer.addLayer(marker);
@@ -284,7 +290,7 @@ async function renderReferenceLayers() {
     );
 
     circle.bindPopup(`
-      <strong>${fence.geofence_name}</strong><br />
+      <strong>${escapeHtml(fence.geofence_name)}</strong><br />
       Radius: ${fence.radius_m}m
     `);
 
@@ -293,6 +299,12 @@ async function renderReferenceLayers() {
 }
 
 async function selectTrip(tripId) {
+  if (liveSocket) {
+    const previous = liveSocket;
+    liveSocket = null;
+    previous.close();
+  }
+  if (reconnectTimer) clearTimeout(reconnectTimer);
   currentTripId = tripId;
 
   [...document.querySelectorAll('.trip-item')]
@@ -311,6 +323,7 @@ async function selectTrip(tripId) {
 
   ensureMap();
   clearMapLayers();
+  liveMarker = null;
 
   await renderReferenceLayers();
 
@@ -319,17 +332,55 @@ async function selectTrip(tripId) {
     p.longitude
   ]);
 
-  if (latlngs.length) {
-    const polyline = L.polyline(
-      latlngs,
-      { weight: 4 }
-    ).addTo(routeLayer);
+  knownPointIds = new Set(detail.points.map(point => point.point_id));
+  livePolyline = L.polyline(latlngs, { weight: 4 }).addTo(routeLayer);
+  if (latlngs.length) map.fitBounds(livePolyline.getBounds(), { padding: [30, 30] });
+  detail.stops.forEach(stop => {
+    L.circleMarker([stop.latitude, stop.longitude], { radius: 8, color: '#b6f09c' })
+      .bindPopup(`Stop: ${Math.round(stop.duration_seconds / 60)} min`)
+      .addTo(markerLayer);
+  });
+  if (detail.trip.status === 'in_progress') connectTripSocket(tripId);
+}
 
-    map.fitBounds(
-      polyline.getBounds(),
-      { padding: [30, 30] }
-    );
+function connectTripSocket(tripId) {
+  if (tripId !== currentTripId) return;
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.host}/ws/trips/${tripId}`);
+  liveSocket = socket;
+  let messageQueue = Promise.resolve();
+  socket.onmessage = event => {
+    messageQueue = messageQueue.then(() => handleMessage(JSON.parse(event.data)))
+      .catch(err => console.error('Live position update failed:', err));
+  };
+  async function handleMessage(data) {
+    if (tripId !== currentTripId) return;
+    if (data.type === 'subscribed') {
+      // Refresh after subscribing to cover the gap between initial GET and socket setup.
+      const snapshot = await fetchJSON(`/api/trips/${tripId}`);
+      if (tripId !== currentTripId || socket !== liveSocket) return;
+      knownPointIds = new Set(snapshot.points.map(point => point.point_id));
+      livePolyline.setLatLngs(snapshot.points.map(point => [point.latitude, point.longitude]));
+      renderTripDetail(snapshot);
+    }
+    if (data.type === 'position' && !knownPointIds.has(data.point_id)) {
+      knownPointIds.add(data.point_id);
+      const position = [data.latitude, data.longitude];
+      livePolyline.addLatLng(position);
+      if (liveMarker) liveMarker.setLatLng(position);
+      else liveMarker = L.circleMarker(position, { radius: 8, color: '#7cc7ff' }).addTo(markerLayer);
+      map.panTo(position);
+    }
+    if (data.type === 'completed') {
+      await selectTrip(tripId);
+      await loadTrips();
+    }
   }
+  socket.onclose = () => {
+    if (tripId === currentTripId && socket === liveSocket) {
+      reconnectTimer = setTimeout(() => connectTripSocket(tripId), 2000);
+    }
+  };
 }
 
 function toIsoFromLocal(value) {

@@ -1,14 +1,130 @@
 import math
 import os
+import time
 from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
+import redis
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
+from flask_sock import Sock
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from simple_websocket import ConnectionClosed
 
 load_dotenv()
 app = Flask(__name__)
+sock = Sock(app)
+cache = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True,
+                       socket_connect_timeout=1, socket_timeout=1)
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
+HTTP_REQUESTS = Counter("routepulse_http_requests_total", "HTTP responses", ["method", "route", "status"])
+HTTP_DURATION = Histogram("routepulse_http_request_duration_seconds", "HTTP request duration", ["method", "route"])
+CACHE_ACCESSES = Counter("routepulse_cache_access_total", "Trip cache access", ["result"])
+POSITION_EVENTS = Counter("routepulse_position_events_total", "Published GPS positions")
+
+
+@app.before_request
+def start_timer():
+    g.request_started_at = time.monotonic()
+
+
+@app.after_request
+def record_request(response):
+    if request.path != "/metrics":
+        route = request.url_rule.rule if request.url_rule else "unmatched"
+        HTTP_REQUESTS.labels(request.method, route, str(response.status_code)).inc()
+        HTTP_DURATION.labels(request.method, route).observe(time.monotonic() - g.request_started_at)
+    return response
+
+
+@app.route("/metrics")
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+@app.route("/api/health/live")
+def live():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/health/ready")
+def ready():
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        finally:
+            conn.close()
+        cache.ping()
+    except (psycopg2.Error, redis.RedisError):
+        return jsonify({"status": "unavailable"}), 503
+    return jsonify({"status": "ok"})
+
+
+def cache_key(trip_id):
+    return f"routepulse:trip:{trip_id}"
+
+
+def invalidate_trip(trip_id):
+    try:
+        cache.delete(cache_key(trip_id))
+    except redis.RedisError:
+        CACHE_ACCESSES.labels("error").inc()
+
+
+def cached_trip_detail(trip_id):
+    if not CACHE_ENABLED:
+        return fetch_trip_detail(trip_id)
+    try:
+        cached = cache.get(cache_key(trip_id))
+        if cached is not None:
+            CACHE_ACCESSES.labels("hit").inc()
+            return app.json.loads(cached)
+        CACHE_ACCESSES.labels("miss").inc()
+    except redis.RedisError:
+        CACHE_ACCESSES.labels("error").inc()
+    detail = fetch_trip_detail(trip_id)
+    if detail is not None:
+        try:
+            cache.setex(cache_key(trip_id), CACHE_TTL_SECONDS, app.json.dumps(detail))
+        except redis.RedisError:
+            CACHE_ACCESSES.labels("error").inc()
+    return detail
+
+
+def publish_position(trip_id, position):
+    try:
+        cache.publish(f"routepulse:trip:{trip_id}:positions", app.json.dumps(position))
+        POSITION_EVENTS.inc()
+    except redis.RedisError:
+        CACHE_ACCESSES.labels("error").inc()
+
+
+@sock.route("/ws/trips/<int:trip_id>")
+def stream_positions(ws, trip_id):
+    """Subscribe before requesting the trip snapshot to avoid missing new points."""
+    pubsub = cache.pubsub()
+    try:
+        pubsub.subscribe(f"routepulse:trip:{trip_id}:positions")
+        ws.send(app.json.dumps({"type": "subscribed", "trip_id": trip_id}))
+        last_heartbeat = time.monotonic()
+        while ws.connected:
+            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+            if message:
+                ws.send(message["data"])
+            if time.monotonic() - last_heartbeat > 15:
+                ws.send(app.json.dumps({"type": "heartbeat"}))
+                last_heartbeat = time.monotonic()
+    except (redis.RedisError, ConnectionClosed, OSError):
+        pass
+    finally:
+        try:
+            pubsub.close()
+        except redis.RedisError:
+            pass
 
 
 def get_db_connection():
@@ -17,7 +133,7 @@ def get_db_connection():
         port=os.getenv("DB_PORT", "5432"),
         dbname=os.getenv("DB_NAME", "routepulse"),
         user=os.getenv("DB_USER", "routeuser"),
-        password=os.getenv("DB_PASS", "password"),
+        password=os.getenv("DB_PASS", "local-only-password"),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -149,15 +265,14 @@ def fetch_trip_detail(trip_id):
 
 
 def nearest_poi_id(cur, lat, lon, max_distance_m=120):
-    cur.execute("SELECT poi_id, latitude, longitude FROM pois")
-    best_id = None
-    best_distance = None
-    for poi in cur.fetchall():
-        distance = haversine_km(lat, lon, poi["latitude"], poi["longitude"]) * 1000
-        if distance <= max_distance_m and (best_distance is None or distance < best_distance):
-            best_id = poi["poi_id"]
-            best_distance = distance
-    return best_id
+    cur.execute("""
+        SELECT poi_id FROM pois
+        WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+        ORDER BY ST_Distance(location, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography)
+        LIMIT 1
+    """, (lon, lat, max_distance_m, lon, lat))
+    row = cur.fetchone()
+    return row["poi_id"] if row else None
 
 
 def refresh_trip_summary(cur, trip_id):
@@ -211,6 +326,33 @@ def refresh_trip_summary(cur, trip_id):
         """,
         (trip_id, metrics["point_count"], metrics["total_distance_km"], metrics["duration_minutes"], metrics["avg_speed_kmh"], len(computed_stops)),
     )
+
+
+def update_summary_for_point(cur, trip_id, point_id, recorded_at):
+    """Update cheap counters on ingestion; derive stops/geofences when the trip ends."""
+    cur.execute("""
+        SELECT COALESCE(ST_Distance(gp.location, prev.location) / 1000.0, 0) AS km
+        FROM gps_points gp
+        LEFT JOIN LATERAL (
+            SELECT location FROM gps_points
+            WHERE trip_id = %s AND recorded_at < gp.recorded_at
+            ORDER BY recorded_at DESC LIMIT 1
+        ) prev ON true
+        WHERE gp.point_id = %s
+    """, (trip_id, point_id))
+    distance_km = float(cur.fetchone()["km"])
+    cur.execute("SELECT recorded_at FROM gps_points WHERE trip_id = %s ORDER BY recorded_at LIMIT 1", (trip_id,))
+    first_at = cur.fetchone()["recorded_at"]
+    duration_minutes = max((recorded_at - first_at).total_seconds() / 60.0, 0.0)
+    cur.execute("""
+        UPDATE trip_summaries SET
+            point_count = point_count + 1,
+            total_distance_km = total_distance_km + %s,
+            duration_minutes = %s,
+            avg_speed_kmh = CASE WHEN %s > 0 THEN (total_distance_km + %s) / (%s / 60.0) ELSE 0 END,
+            updated_at = NOW()
+        WHERE trip_id = %s
+    """, (distance_km, duration_minutes, duration_minutes, distance_km, duration_minutes, trip_id))
 
 
 @app.route("/")
@@ -311,7 +453,7 @@ def list_trips():
 
 @app.route("/api/trips/<int:trip_id>")
 def trip_detail(trip_id):
-    detail = fetch_trip_detail(trip_id)
+    detail = cached_trip_detail(trip_id)
     if not detail:
         return jsonify({"error": "Trip not found"}), 404
     return jsonify(detail)
@@ -327,6 +469,33 @@ def reference_data():
             cur.execute("SELECT poi_id, poi_name, category, latitude, longitude FROM pois ORDER BY poi_name")
             pois = cur.fetchall()
         return jsonify({"geofences": geofences, "pois": pois})
+    finally:
+        conn.close()
+
+
+@app.route("/api/nearby/points")
+def nearby_points():
+    try:
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+        radius_m = float(request.args.get("radius_m", "500"))
+        limit = int(request.args.get("limit", "100"))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180 and 0 < radius_m <= 10000 and 1 <= limit <= 500):
+            raise ValueError("out of range")
+    except (KeyError, ValueError):
+        return jsonify({"error": "Specify valid lat, lon, radius_m (0-10000), and limit (1-500)."}), 400
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT point_id, trip_id, latitude, longitude, recorded_at,
+                    ST_Distance(location, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography) AS distance_m
+                FROM gps_points
+                WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+                ORDER BY distance_m, point_id LIMIT %s
+            """, (lon, lat, lon, lat, radius_m, limit))
+            rows = cur.fetchall()
+        return jsonify([{**dict(row), "recorded_at": iso(row["recorded_at"])} for row in rows])
     finally:
         conn.close()
 
@@ -355,21 +524,44 @@ def start_trip():
 
 @app.route("/api/trips/<int:trip_id>/points", methods=["POST"])
 def add_trip_point(trip_id):
-    payload = request.get_json(force=True)
+    payload = request.get_json(silent=True) or {}
     required = ["latitude", "longitude", "recorded_at"]
     missing = [field for field in required if field not in payload]
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    lat, lon, error = validate_lat_lon(payload["latitude"], payload["longitude"])
+    if error:
+        return jsonify({"error": error}), 400
+    try:
+        recorded_at = datetime.fromisoformat(payload["recorded_at"].replace("Z", "+00:00"))
+        if recorded_at.tzinfo is None:
+            raise ValueError("timezone required")
+    except (AttributeError, ValueError):
+        return jsonify({"error": "recorded_at must be an ISO 8601 timestamp with a timezone."}), 400
 
     conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT status, started_at FROM trips WHERE trip_id = %s FOR UPDATE", (trip_id,))
+                trip = cur.fetchone()
+                if not trip:
+                    return jsonify({"error": "Trip not found"}), 404
+                if trip["status"] != "in_progress":
+                    return jsonify({"error": "Trip is already completed"}), 409
+                cur.execute("SELECT MAX(recorded_at) AS latest FROM gps_points WHERE trip_id = %s", (trip_id,))
+                latest = cur.fetchone()["latest"]
+                if recorded_at < trip["started_at"] or (latest and recorded_at <= latest):
+                    return jsonify({"error": "recorded_at must be after the prior point and not before trip start."}), 400
                 cur.execute(
                     "INSERT INTO gps_points (trip_id, latitude, longitude, recorded_at, accuracy_m, speed_kmh) VALUES (%s, %s, %s, %s, %s, %s) RETURNING point_id",
-                    (trip_id, payload["latitude"], payload["longitude"], payload["recorded_at"], payload.get("accuracy_m"), payload.get("speed_kmh")),
+                    (trip_id, lat, lon, recorded_at, payload.get("accuracy_m"), payload.get("speed_kmh")),
                 )
                 point_id = cur.fetchone()["point_id"]
+                update_summary_for_point(cur, trip_id, point_id, recorded_at)
+        invalidate_trip(trip_id)
+        publish_position(trip_id, {"type": "position", "trip_id": trip_id, "point_id": point_id,
+                                   "latitude": lat, "longitude": lon, "recorded_at": iso(recorded_at)})
         return jsonify({"point_id": point_id}), 201
     finally:
         conn.close()
@@ -378,16 +570,30 @@ def add_trip_point(trip_id):
 @app.route("/api/trips/<int:trip_id>/end", methods=["POST"])
 def end_trip(trip_id):
     payload = request.get_json(silent=True) or {}
-    ended_at = payload.get("ended_at") or datetime.now(timezone.utc).isoformat()
+    try:
+        ended_at = datetime.fromisoformat((payload.get("ended_at") or datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00"))
+        if ended_at.tzinfo is None:
+            raise ValueError("timezone required")
+    except (AttributeError, ValueError):
+        return jsonify({"error": "ended_at must be an ISO 8601 timestamp with a timezone."}), 400
     conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE trips SET ended_at = %s, status = 'completed' WHERE trip_id = %s RETURNING trip_id", (ended_at, trip_id))
-                row = cur.fetchone()
-                if not row:
+                cur.execute("SELECT started_at, status FROM trips WHERE trip_id = %s FOR UPDATE", (trip_id,))
+                trip = cur.fetchone()
+                if not trip:
                     return jsonify({"error": "Trip not found"}), 404
+                if trip["status"] == "completed":
+                    return jsonify({"error": "Trip is already completed"}), 409
+                cur.execute("SELECT MAX(recorded_at) AS latest FROM gps_points WHERE trip_id = %s", (trip_id,))
+                latest = cur.fetchone()["latest"]
+                if ended_at < trip["started_at"] or (latest and ended_at < latest):
+                    return jsonify({"error": "ended_at must be after trip start and the last point."}), 400
+                cur.execute("UPDATE trips SET ended_at = %s, status = 'completed' WHERE trip_id = %s", (ended_at, trip_id))
                 refresh_trip_summary(cur, trip_id)
+        invalidate_trip(trip_id)
+        publish_position(trip_id, {"type": "completed", "trip_id": trip_id})
         return jsonify(fetch_trip_detail(trip_id))
     finally:
         conn.close()
@@ -411,17 +617,21 @@ def validate_lat_lon(lat, lon):
 
 
 def validate_trip_payload(payload, require_points=True):
+    if not isinstance(payload, dict):
+        return "Provide a JSON object.", None
     required = ["user_id", "device_id", "started_at"]
     missing = [field for field in required if not payload.get(field)]
     if missing:
         return f"Missing fields: {', '.join(missing)}", None
 
     points = payload.get("points", [])
-    if require_points and len(points) < 2:
+    if not isinstance(points, list) or (require_points and len(points) < 2):
         return "A trip needs at least two coordinate points.", None
 
     cleaned_points = []
     for index, point in enumerate(points, start=1):
+        if not isinstance(point, dict):
+            return f"Point {index} must be an object.", None
         lat, lon, error = validate_lat_lon(point.get("latitude"), point.get("longitude"))
         if error:
             return f"Point {index}: {error}", None
@@ -436,6 +646,18 @@ def validate_trip_payload(payload, require_points=True):
 
     started_at = payload.get("started_at")
     ended_at = payload.get("ended_at") or None
+    try:
+        start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(ended_at.replace("Z", "+00:00")) if ended_at else None
+        point_dts = [datetime.fromisoformat(p["recorded_at"].replace("Z", "+00:00")) for p in cleaned_points]
+        if start_dt.tzinfo is None or (end_dt and end_dt.tzinfo is None) or any(p.tzinfo is None for p in point_dts):
+            raise ValueError("timezone required")
+        if (end_dt and end_dt < start_dt) or any(p < start_dt or (end_dt and p > end_dt) for p in point_dts):
+            raise ValueError("point outside trip")
+        if point_dts != sorted(point_dts) or len(set(point_dts)) != len(point_dts):
+            raise ValueError("points not strictly ordered")
+    except (AttributeError, ValueError):
+        return "Timestamps must include a timezone, be ordered, and fall within the trip interval.", None
     status = "completed" if ended_at else "in_progress"
 
     return None, {
@@ -469,7 +691,7 @@ def insert_points(cur, trip_id, points):
 
 @app.route("/api/trips", methods=["POST"])
 def create_trip_with_points():
-    payload = request.get_json(force=True)
+    payload = request.get_json(silent=True)
     error, data = validate_trip_payload(payload, require_points=True)
     if error:
         return jsonify({"error": error}), 400
@@ -496,7 +718,7 @@ def create_trip_with_points():
 
 @app.route("/api/trips/<int:trip_id>", methods=["PUT"])
 def update_trip_with_points(trip_id):
-    payload = request.get_json(force=True)
+    payload = request.get_json(silent=True)
     error, data = validate_trip_payload(payload, require_points=True)
     if error:
         return jsonify({"error": error}), 400
@@ -525,6 +747,7 @@ def update_trip_with_points(trip_id):
                 cur.execute("DELETE FROM gps_points WHERE trip_id = %s", (trip_id,))
                 insert_points(cur, trip_id, data["points"])
                 refresh_trip_summary(cur, trip_id)
+        invalidate_trip(trip_id)
         return jsonify(fetch_trip_detail(trip_id))
     finally:
         conn.close()
@@ -540,9 +763,10 @@ def delete_trip(trip_id):
                 row = cur.fetchone()
                 if not row:
                     return jsonify({"error": "Trip not found"}), 404
+        invalidate_trip(trip_id)
         return jsonify({"message": f"Trip {trip_id} deleted. Related gps_points, summaries, stops, and geofence rows were removed by ON DELETE CASCADE."})
     finally:
         conn.close()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1")
