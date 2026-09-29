@@ -1,0 +1,169 @@
+
+// Use a MongoDB database for the demo
+
+db = db.getSiblingDB("routepulse_nosql");
+
+// Start fresh for the demo
+db.trip_documents.drop();
+
+
+// Insert sample trip documents
+db.trip_documents.insertMany([
+  {
+    trip_id: 8,
+    user: {
+      user_id: 1,
+      full_name: "Aubin Darcy Irakoze"
+    },
+    device: {
+      device_id: 2,
+      device_name: "Tello Tracker",
+      device_type: "vehicle_tracker"
+    },
+    started_at: ISODate("2026-03-27T18:20:00Z"),
+    ended_at: ISODate("2026-03-27T19:08:00Z"),
+    status: "completed",
+    summary: {
+      total_distance_km: 4.587,
+      duration_minutes: 48,
+      avg_speed_kmh: 5.73,
+      stop_count: 0,
+      point_count: 8
+    },
+    tags: ["commute", "evening", "long_route"],
+    route_points: [
+      {
+        latitude: 45.549180,
+        longitude: -94.160150,
+        recorded_at: ISODate("2026-03-27T18:20:00Z"),
+        speed_kmh: 0
+      },
+      {
+        latitude: 45.550800,
+        longitude: -94.158900,
+        recorded_at: ISODate("2026-03-27T18:27:00Z"),
+        speed_kmh: 22
+      },
+      {
+        latitude: 45.552600,
+        longitude: -94.156500,
+        recorded_at: ISODate("2026-03-27T18:34:00Z"),
+        speed_kmh: 27
+      }
+    ],
+    geofence_crossings: [
+      {
+        geofence_name: "River Park",
+        entered_at: ISODate("2026-03-27T18:20:00Z"),
+        exited_at: ISODate("2026-03-27T18:28:00Z")
+      },
+      {
+        geofence_name: "Campus Core",
+        entered_at: ISODate("2026-03-27T18:38:00Z"),
+        exited_at: ISODate("2026-03-27T18:45:00Z")
+      },
+      {
+        geofence_name: "Downtown",
+        entered_at: ISODate("2026-03-27T18:55:00Z"),
+        exited_at: ISODate("2026-03-27T19:08:00Z")
+      }
+    ]
+  },
+
+  {
+    trip_id: 10,
+    user: {
+      user_id: 4,
+      full_name: "Amory Donel ND"
+    },
+    device: {
+      device_id: 5,
+      device_name: "Delivery Van Tracker",
+      device_type: "vehicle_tracker"
+    },
+    started_at: ISODate("2026-03-28T14:15:00Z"),
+    ended_at: ISODate("2026-03-28T15:02:00Z"),
+    status: "completed",
+    summary: {
+      total_distance_km: 2.208,
+      duration_minutes: 47,
+      avg_speed_kmh: 2.82,
+      stop_count: 1,
+      point_count: 7
+    },
+    tags: ["errand", "healthcare"],
+    route_points: [
+      {
+        latitude: 45.556390,
+        longitude: -94.166370,
+        recorded_at: ISODate("2026-03-28T14:15:00Z"),
+        speed_kmh: 0
+      },
+      {
+        latitude: 45.557740,
+        longitude: -94.176390,
+        recorded_at: ISODate("2026-03-28T14:36:00Z"),
+        speed_kmh: 8
+      },
+      {
+        latitude: 45.556390,
+        longitude: -94.166370,
+        recorded_at: ISODate("2026-03-28T15:02:00Z"),
+        speed_kmh: 0
+      }
+    ],
+    stops: [
+      {
+        started_at: ISODate("2026-03-28T14:36:00Z"),
+        ended_at: ISODate("2026-03-28T14:48:00Z"),
+        duration_seconds: 720,
+        nearest_poi: "CentraCare"
+      }
+    ]
+  }
+]);
+
+
+print("\n==============================");
+print("MongoDB NoSQL Demo Loaded");
+print("==============================");
+
+print("\nDatabase: routepulse_nosql");
+print("Collection: trip_documents");
+
+print("\nTotal documents inserted:");
+print(db.trip_documents.countDocuments());
+
+print("\n==============================");
+print("All trip documents");
+print("==============================");
+db.trip_documents.find().forEach(doc => printjson(doc));
+
+print("\n==============================");
+print("Filter Query 1: Trips tagged as commute");
+print("==============================");
+db.trip_documents.find(
+  { tags: "commute" },
+  {
+    _id: 0,
+    trip_id: 1,
+    "user.full_name": 1,
+    "device.device_name": 1,
+    tags: 1,
+    "summary.total_distance_km": 1
+  }
+).forEach(doc => printjson(doc));
+
+print("\n==============================");
+print("Filter Query 2: Trips longer than 3 km");
+print("==============================");
+db.trip_documents.find(
+  { "summary.total_distance_km": { $gt: 3 } },
+  {
+    _id: 0,
+    trip_id: 1,
+    "user.full_name": 1,
+    tags: 1,
+    "summary.total_distance_km": 1
+  }
+).forEach(doc => printjson(doc));
