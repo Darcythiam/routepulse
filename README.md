@@ -81,7 +81,3 @@ terraform plan
 ```
 
 Supply `TF_VAR_db_password` and `TF_VAR_redis_auth_token` through a secret manager or protected environment. Use a protected remote Terraform state backend before real deployment; state can include database and Redis credentials. Do not commit `terraform.tfvars` or state files. After provisioning, build/push the image, replace the image placeholder in `k8s/deployment.yaml`, create the `routepulse-secrets` Kubernetes Secret with `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS`, and TLS `REDIS_URL`, and apply the manifest. Database initialization requires a VPC-connected environment. The `Service` has type `LoadBalancer`, so exposure and WebSocket support need review for the target network. The Kubernetes CPU/memory values are initial requests and limits, **not measured right-sizing results**.
-
-## Claim status
-
-This is an implementation and measurement harness. It has not been provisioned in AWS or load tested at one million rows in this environment. Do not present ~90% spatial improvement, 90%+ cache hits, ~75% p95 improvement, 500–1,000+ RPS, 0.09% errors, or 30–50% request tuning as observed results until saved evidence supports each number. The demo API has no authentication or tenant separation and should not be exposed publicly without adding those controls.
